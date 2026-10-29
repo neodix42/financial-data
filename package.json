@@ -1,0 +1,15 @@
+{
+  "name": "financial-data",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test",
+    "download": "node scripts/snapshot.mjs",
+    "catalog": "node scripts/snapshot.mjs --catalog"
+  },
+  "dependencies": {
+    "dukascopy-node": "1.51.1"
+  }
+}

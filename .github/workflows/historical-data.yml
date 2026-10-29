@@ -1,0 +1,58 @@
+name: Historical data
+
+on:
+  schedule:
+    - cron: '0 0 * * 6' # Saturday midnight UTC.
+  workflow_dispatch:
+    inputs:
+      threads:
+        description: Maximum concurrent Dukascopy requests (1–200)
+        type: number
+        default: 50
+      budget_minutes:
+        description: Stop downloading and checkpoint after this many minutes (maximum 300)
+        type: number
+        default: 300
+
+permissions:
+  contents: write
+  actions: read # Detect queued Saturday runs and checkpoint the current run first.
+
+concurrency:
+  group: historical-data-snapshot
+  # A queued Saturday run is a cooperative signal, not a runner kill request.
+  # The current downloader checkpoints and exits, then GitHub starts its successor.
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Record attempt start
+        run: echo "SNAPSHOT_STARTED_AT=$(date +%s%3N)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install provider browser
+        run: npx --no-install dukascopy-node --install-browser --with-deps
+
+      - name: Verify downloader
+        run: npm test
+
+      - name: Download, checkpoint or publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOWNLOAD_THREADS: ${{ inputs.threads || 50 }}
+          DOWNLOAD_BUDGET_MINUTES: ${{ inputs.budget_minutes || 300 }}
+          SNAPSHOT_WORKFLOW: historical-data.yml
+        run: npm run download
