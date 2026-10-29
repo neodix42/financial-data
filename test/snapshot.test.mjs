@@ -182,6 +182,141 @@ test('publishes complete real archives and index; weekly refresh replaces overla
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
+test('bad source OHLC candles are omitted from compact CSV files and incremental updates keep original timestamps', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'financial-source-ohlc-'));
+  try {
+    const client = new FakeGitHub();
+    const sourceCatalog = [{
+      instrument: 'usatechidxusd', category: 'America 🌎', categorySlug: 'america',
+      starts: { h1: '2000-01-01T00:00:00.000Z', d1: '2000-01-01T00:00:00.000Z' },
+    }];
+    // Exact values from the provider's USATECH.IDX-USD/BID/2000 response:
+    // April 3 opens above its reported high; April 7 opens below its low.
+    const sourceRows = [
+      { timestamp: Date.parse('2000-04-03T00:00:00.000Z'), open: 4397.84,
+        high: 4355.7, low: 4041.24, close: 4077.02, volume: 0 },
+      { timestamp: Date.parse('2000-04-07T00:00:00.000Z'), open: 4086.73,
+        high: 4292.88, low: 4111.18, close: 4291.53, volume: 0 },
+      bar('2000-12-29T00:00:00.000Z', 2700),
+    ];
+    const logs = [];
+    const first = await snapshot(client, join(directory, 'initial'), {
+      catalog: sourceCatalog, cutoff: '2001-01-01T00:00:00.000Z',
+      poolFactory: poolProvider({ rows: sourceRows }), log: message => logs.push(message),
+    });
+    assert.equal(first.status, 'published');
+    const stored = await readInstrument(client, first.releaseId, 'usatechidxusd', 'd1', join(directory, 'initial-read'));
+    assert.equal(stored.summary.rows, 1, 'bad provider candles must not enter the archive');
+    const sourceLines = [
+      '2000-04-03T00:00:00.000Z,4397.84,4355.7,4041.24,4077.02,0',
+      '2000-04-07T00:00:00.000Z,4086.73,4292.88,4111.18,4291.53,0',
+    ];
+    for (const line of sourceLines) assert.ok(!stored.text.split('\n').includes(line), 'bad OHLC values must be omitted instead of clamped');
+    const initialLines = stored.text.trimEnd().split('\n');
+    assert.equal(initialLines.length, 2, 'CSV contains only its header and valid bars, without gap placeholders');
+    assert.ok(initialLines.every(line => line.length > 0), 'removing bad bars must not leave blank CSV rows');
+    assert.equal(initialLines[1].split(',')[0], '2000-12-29T00:00:00.000Z', 'valid bar timestamps must not be shifted');
+    assert.ok(logs.some(message => message.includes('::warning::') && message.includes('usatechidxusd') &&
+      message.includes('d1') && message.includes('2000-04-03') && /omitt|drop|skip|discard/i.test(message)),
+    'warning identifies omitted data by instrument, period and datetime');
+    assert.match(client.asset(first.releaseId, 'index.txt').bytes.toString(),
+      /usatechidxusd\td1\tAmerica 🌎\t2000-12-29T00:00:00.000Z\t2000-12-29T00:00:00.000Z\t1\tok/);
+
+    const tasks = [];
+    const updated = await snapshot(client, join(directory, 'weekly'), {
+      catalog: sourceCatalog, cutoff: '2001-01-08T00:00:00.000Z',
+      poolFactory: poolProvider({ rows: [...sourceRows, bar('2001-01-02T00:00:00.000Z', 2800)], tasks }),
+    });
+    assert.equal(updated.status, 'published');
+    const refreshed = await readInstrument(client, updated.releaseId, 'usatechidxusd', 'd1', join(directory, 'weekly-read'));
+    assert.equal(refreshed.summary.rows, 2);
+    for (const line of sourceLines) assert.ok(!refreshed.text.split('\n').includes(line), 'omitted bad bars must remain absent after an update');
+    const refreshedLines = refreshed.text.trimEnd().split('\n');
+    assert.ok(refreshedLines.every(line => line.length > 0));
+    assert.deepEqual(refreshedLines.slice(1).map(line => line.split(',')[0]),
+      ['2000-12-29T00:00:00.000Z', '2001-01-02T00:00:00.000Z'], 'updates append valid rows without rewriting or inventing timestamps');
+    assert.match(client.asset(updated.releaseId, 'index.txt').bytes.toString(),
+      /usatechidxusd\td1\tAmerica 🌎\t2000-12-29T00:00:00.000Z\t2001-01-02T00:00:00.000Z\t2\tok/);
+    assert.ok(tasks.every(task => Date.parse(task.from) >= Date.parse('2000-12-29T00:00:00.000Z')),
+      'weekly refresh resumes from the latest bar instead of redownloading anomalous old rows');
+    assert.equal(client.releases.length, 1);
+    assert.equal(client.releases[0].id, updated.releaseId);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('instrument download or processing failures checkpoint other work and retry only the failed cursor next run', async t => {
+  for (const scenario of ['reported provider error', 'rejected download', 'invalid bar timestamp']) {
+    await t.test(scenario, async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'financial-isolated-failure-'));
+      try {
+        const client = new FakeGitHub();
+        const multiCategoryCatalog = [
+          { instrument: 'usatechidxusd', category: 'America 🌎', categorySlug: 'america', starts: { h1: start, d1: start } },
+          { instrument: 'usa500idxusd', category: 'America 🌎', categorySlug: 'america', starts: { h1: start, d1: start } },
+          catalog[0],
+        ];
+        const initialRows = [bar(start), bar('2026-01-02T00:00:00.000Z')];
+        const previous = await snapshot(client, join(directory, 'previous'), {
+          catalog: multiCategoryCatalog, poolFactory: poolProvider({ rows: initialRows }),
+        });
+        const cutoff = '2026-03-02T00:00:00.000Z';
+        const updatedRows = [...initialRows, bar('2026-01-03T00:00:00.000Z'),
+          bar('2026-02-01T00:00:00.000Z'), bar('2026-03-01T00:00:00.000Z')];
+        const tasks = [];
+        const logs = [];
+        const eventOffset = client.events.length;
+        const attempt = await snapshot(client, join(directory, 'partially-failed'), {
+          catalog: multiCategoryCatalog, cutoff, log: message => logs.push(message),
+          poolFactory: poolProvider({ rows: updatedRows, tasks, onTask(task) {
+            if (task.instrument !== 'usatechidxusd' || task.period !== 'd1') return;
+            if (scenario === 'reported provider error') return { error: new Error('Provider unavailable') };
+            if (scenario === 'rejected download') throw new Error('Download promise rejected');
+            return { bars: [{ ...bar('2026-01-03T00:00:00.000Z'), timestamp: 'invalid timestamp' }] };
+          } }),
+        });
+        assert.equal(attempt.status, 'checkpointed');
+        assert.match(attempt.reason, /retry/i);
+        const failedTasks = tasks.filter(task => task.instrument === 'usatechidxusd' && task.period === 'd1');
+        assert.equal(failedTasks.length, 1, 'a failing cursor is not retried repeatedly in the same attempt');
+        assert.equal(failedTasks[0].from, '2026-01-02T00:00:00.000Z');
+        const checkpoint = client.checkpoint(attempt.releaseId);
+        const hourlyAndLaterGroups = checkpoint.groups.filter(group => group.id !== 'america-d1');
+        assert.ok(hourlyAndLaterGroups.every(group => group.pairs.every(pair => pair.hasZip && pair.cursor === cutoff)),
+          'later periods and categories must finish after the earlier D1 failure');
+        const daily = checkpoint.groups.find(group => group.id === 'america-d1');
+        const failedPair = daily.pairs.find(pair => pair.instrument === 'usatechidxusd');
+        assert.equal(failedPair.cursor, failedTasks[0].from, 'failure must leave the retry cursor unchanged');
+        assert.equal(failedPair.summary.rows, initialRows.length, 'existing data survives a failed update');
+        const peer = daily.pairs.find(pair => pair.instrument === 'usa500idxusd');
+        assert.equal(peer.cursor, cutoff);
+        assert.equal(peer.summary.rows, updatedRows.length);
+        assert.ok(logs.some(message => message.includes('::warning::') && message.includes('usatechidxusd') &&
+          message.includes('d1') && message.includes('2026-01-02') && /retry/i.test(message)),
+        'failed chunks are logged with sufficient context for retry');
+        assert.ok(client.releases.some(release => release.id === previous.releaseId && !release.draft));
+        assert.ok(!client.events.slice(eventOffset).some(event => ['publish', 'deleteRelease'].includes(event.type)),
+          'an incomplete replacement must not publish or remove its predecessor');
+
+        const resumeTasks = [];
+        const resumed = await snapshot(client, join(directory, 'resumed'), {
+          catalog: multiCategoryCatalog, cutoff,
+          poolFactory: poolProvider({ rows: updatedRows, tasks: resumeTasks }),
+        });
+        assert.equal(resumed.status, 'published');
+        assert.equal(resumed.releaseId, attempt.releaseId);
+        assert.equal(resumeTasks.length, 1, 'completed instruments and categories are not downloaded again');
+        assert.equal(resumeTasks[0].instrument, 'usatechidxusd');
+        assert.equal(resumeTasks[0].period, 'd1');
+        assert.equal(resumeTasks[0].from, failedTasks[0].from);
+        const restored = await readInstrument(client, resumed.releaseId, 'usatechidxusd', 'd1', join(directory, 'read'));
+        assert.equal(restored.summary.rows, updatedRows.length);
+        assert.equal(client.releases.length, 1);
+        assert.equal(client.releases[0].id, resumed.releaseId);
+      } finally { await rm(directory, { recursive: true, force: true }); }
+    });
+  }
+});
+
 test('an interrupted backfill checkpoints real partial files and resumes the next month without repeating completed groups', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'financial-snapshot-'));
   try {

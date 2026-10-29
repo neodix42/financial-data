@@ -97,6 +97,14 @@ cutoff are stored. Actual zero-volume/flat provider candles are preserved;
 synthetic gap candles inserted by the library are removed. Weekends and market
 holidays are not filled with invented bars.
 
+Invalid OHLCV bars are omitted, including non-finite values, open/close outside
+the high/low range, inverted high/low, and negative volume. The workflow logs a
+warning with the instrument, period, count and an example timestamp, then keeps
+processing the chunk. CSV rows remain contiguous with no blank lines or
+placeholders; valid timestamps and prices are unchanged. A removed bar's timestamp
+is absent: replacement prices or timestamps are not invented. A bad update does
+not overwrite an existing valid bar.
+
 `index.txt` is tab-separated, one row per instrument and period:
 
 ```text
@@ -106,8 +114,13 @@ instrument  period  category  first_bar_utc  last_bar_utc  rows  status  archive
 First/last datetimes come from the stored CSV, not the fetch time. A successfully
 empty history has `-` datetimes, zero rows and `no_data` status, plus a header-only
 CSV in its ZIP. Inactive instruments retain their existing histories. Network,
-access-denied and malformed-data errors prevent publication and are never
-reported as empty history.
+access-denied and malformed-data errors are never reported as empty history.
+An instrument-level download or processing error logs a warning, retains that
+chunk's cursor for retry on the next attempt, and lets other instruments and
+categories continue checkpointing. An attempt with pending failed chunks exits
+successfully as `checkpointed`; it does not publish an incomplete replacement.
+Errors writing or validating a durable checkpoint still stop the run so unsafe
+state cannot replace the last recoverable checkpoint.
 
 `manifest.json` records the full category and instrument mapping, progress,
 cutoff, configuration, archive sizes and SHA-256 checksums. Data files are stored

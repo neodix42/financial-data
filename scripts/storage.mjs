@@ -22,24 +22,36 @@ function validatePrices(values) {
   }
   const [openPrice, high, low, close, volume] = values;
   if (high < Math.max(openPrice, close, low) || low > Math.min(openPrice, close, high) || volume < 0) {
-    throw new Error('Invalid OHLCV range');
+    throw new Error(`Invalid OHLCV range: ${JSON.stringify({ open: openPrice, high, low, close, volume })}`);
   }
 }
 
-function normalizeBars(bars, { from, cutoff, period }) {
+function normalizeBars(bars, { from, cutoff, period, onWarning, source }) {
   const duration = DURATIONS[period];
   if (!duration) throw new Error(`Unsupported period: ${period}`);
   const start = epoch(from, 'from');
   const end = epoch(cutoff, 'cutoff');
   const unique = new Map();
+  const rejected = [];
   for (const bar of bars) {
     const timestamp = epoch(bar.timestamp, 'bar timestamp');
-    const values = [bar.open, bar.high, bar.low, bar.close, bar.volume];
-    validatePrices(values);
     if (timestamp < start || timestamp + duration > end) continue;
-    unique.set(timestamp, { timestamp, line: `${new Date(timestamp).toISOString()},${values.join(',')}\n` });
+    const values = [bar.open, bar.high, bar.low, bar.close, bar.volume];
+    try { validatePrices(values); }
+    catch (error) {
+      rejected.push({ timestamp, reason: error.message });
+      continue;
+    }
+    unique.set(timestamp, { timestamp,
+      line: `${new Date(timestamp).toISOString()},${values.join(',')}\n` });
   }
-  return [...unique.values()].sort((a, b) => a.timestamp - b.timestamp);
+  const incoming = [...unique.values()].sort((a, b) => a.timestamp - b.timestamp);
+  if (rejected.length && onWarning) {
+    const first = rejected[0];
+    onWarning(`${source} (${period}): omitted ${rejected.length} invalid OHLCV candle(s); ` +
+      `no blank rows or placeholders were written. First at ${new Date(first.timestamp).toISOString()}: ${first.reason}`);
+  }
+  return incoming;
 }
 
 function parseRow(line) {
@@ -134,7 +146,7 @@ async function writeAll(handle, buffer, position) {
 
 /** Merge one downloaded chunk. Pass the last returned summary to avoid rescanning history. */
 export async function mergeBars(path, bars, options) {
-  const incoming = normalizeBars(bars, options);
+  const incoming = normalizeBars(bars, { ...options, source: basename(path) });
   await mkdir(dirname(path), { recursive: true });
   let summary = await existingSummary(path, options.summary);
   if (!summary) {

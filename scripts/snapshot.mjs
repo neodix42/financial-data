@@ -210,6 +210,12 @@ export async function runSnapshot({
   validateState(state, catalog);
   let pool;
   let failure;
+  const failedPairs = new Set();
+  const recordFailure = (group, task, error) => {
+    failedPairs.add(`${group.id}/${task.instrument}`);
+    log(`::warning::${task.instrument} ${task.period} [${task.from}, ${task.to}): ${error.message}. ` +
+      'Cursor retained for retry next run; continuing other instruments.');
+  };
   let chunks = 0;
   const stopHandler = () => { stop.requested = true; void pool?.stop(); };
   process.once('SIGTERM', stopHandler);
@@ -231,7 +237,8 @@ export async function runSnapshot({
       let lastCheckpointAt = Date.now();
       let dirty = false;
       while (Date.now() < deadline && !stop.requested && !failure) {
-        const jobs = group.pairs.filter(pair => nextChunk(pair, group.period, state.cutoff)).slice(0, parallel);
+        const jobs = group.pairs.filter(pair => !failedPairs.has(`${group.id}/${pair.instrument}`) &&
+          nextChunk(pair, group.period, state.cutoff)).slice(0, parallel);
         if (!jobs.length) break;
         const free = await statfs(workDirectory);
         if (free.bavail * free.bsize < 512 * 1024 ** 2) {
@@ -241,22 +248,37 @@ export async function runSnapshot({
         if (stop.requested || Date.now() >= deadline) break;
         pool ??= poolFactory({ deadline });
         const tasks = jobs.map(pair => nextChunk(pair, group.period, state.cutoff));
-        const results = await Promise.all(tasks.map(task => pool.download(task)));
+        const results = await Promise.all(tasks.map(async task => {
+          try { return await pool.download(task); }
+          catch (error) { return { error }; }
+        }));
         for (const [index, result] of results.entries()) {
-          if (result.error) { failure ??= result.error; continue; }
-          if (result.cancelled) continue;
           const pair = jobs[index];
           const task = tasks[index];
+          if (result.error) { recordFailure(group, task, result.error); continue; }
+          if (result.cancelled) {
+            if (!stop.requested && Date.now() < deadline) recordFailure(group, task, new Error('Download cancelled before completion'));
+            continue;
+          }
           try {
             const csv = await ensureCsv(pair, group, directory, state.cutoff);
             pair.summary = await mergeBars(csv, result.bars, {
               from: task.from, cutoff: state.cutoff, period: group.period, summary: pair.summary,
+              onWarning: message => log(`::warning::${message}`),
             });
-            pair.cursor = task.to;
             dirty = true;
+            if (Date.parse(task.to) >= Date.parse(state.cutoff)) await finishZip(pair, group, directory);
+            pair.cursor = task.to;
             chunks += 1;
-            if (!nextChunk(pair, group.period, state.cutoff)) await finishZip(pair, group, directory);
-          } catch (error) { failure ??= error; }
+          } catch (error) {
+            recordFailure(group, task, error);
+          }
+        }
+        // A worker timeout/crash settles its active tasks. Other instruments can
+        // continue in a fresh worker; failed cursors stay pending until next run.
+        if (pool?.stopped && !stop.requested && Date.now() < deadline) {
+          await pool.stop();
+          pool = null;
         }
         if (chunks && chunks % 250 < jobs.length) log(`Saved ${chunks} date chunks this attempt; current category ${group.id}`);
         if (Date.now() - lastCheckpointAt >= checkpointMs && dirty) {
@@ -276,7 +298,8 @@ export async function runSnapshot({
     await pool?.stop();
     if (failure) throw failure;
     if (!isComplete(state)) {
-      const reason = stop.reason ?? (stop.requested ? 'stop requested' : 'download budget reached');
+      const reason = stop.reason ?? (stop.requested ? 'stop requested' : failedPairs.size
+        ? `${failedPairs.size} instrument/period chunk(s) failed; retry pending` : 'download budget reached');
       log(`${reason}. Draft checkpoint saved; the next scheduled/manual run will resume.`);
       return { status: 'checkpointed', releaseId: release.id, chunks, reason };
     }

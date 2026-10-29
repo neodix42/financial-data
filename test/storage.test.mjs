@@ -87,15 +87,61 @@ test('empty history produces only a header and empty refresh preserves history',
   assert.deepEqual(await mergeBars(csv, [], { ...options, summary: populated }), populated);
 });
 
-test('D1 closes at a full day and incoming invalid bars leave history unchanged', async t => {
+test('D1 closes at a full day and invalid incoming bars are omitted without changing history', async t => {
   const directory = await temporary(t);
   const csv = join(directory, 'eurusd-d1.csv');
   await mergeBars(csv, [bar(0), bar(24)], { ...options, cutoff: start + 36 * hour, period: 'd1' });
   const original = await readFile(csv, 'utf8');
   assert.equal((await inspectCsv(csv)).rows, 1);
-  await assert.rejects(mergeBars(csv, [{ ...bar(1), volume: NaN }], options), /Non-finite/);
-  await assert.rejects(mergeBars(csv, [{ ...bar(1), low: 9 }], options), /OHLCV range/);
+  const warnings = [];
+  await mergeBars(csv, [{ ...bar(1), volume: NaN }, { ...bar(1), low: 9 }], {
+    ...options, onWarning: message => warnings.push(message),
+  });
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /omitted 2 invalid OHLCV/);
   assert.equal(await readFile(csv, 'utf8'), original);
+});
+
+test('bad bars are omitted without blank rows, fabricated prices or changed timestamps', async t => {
+  const directory = await temporary(t);
+  const csv = join(directory, 'usatechidxusd-d1.csv');
+  const warnings = [];
+  const invalid = [
+    { ...bar(1), open: 5 }, { ...bar(2), close: 0 },
+    { ...bar(3), high: 0 }, { ...bar(4), volume: -1 },
+    { ...bar(5), open: NaN }, { ...bar(6), close: Infinity },
+  ];
+  const summary = await mergeBars(csv, [bar(0), ...invalid, bar(7)], {
+    ...options, onWarning: message => warnings.push(message),
+  });
+  assert.equal(summary.rows, 2);
+  assert.equal(await readFile(csv, 'utf8'), CSV_HEADER +
+    '2020-01-01T00:00:00.000Z,2,4,1,2,5\n' +
+    '2020-01-01T07:00:00.000Z,2,4,1,2,5\n');
+  assert.deepEqual(await inspectCsv(csv), summary);
+  assert.match(warnings[0], /usatechidxusd-d1.csv.*omitted 6/);
+  assert.match(warnings[0], /2020-01-01T01:00:00.000Z/);
+});
+
+test('a bad overlapping update cannot replace a good saved bar; wider merges stay compact', async t => {
+  const directory = await temporary(t);
+  const csv = join(directory, 'eurusd-h1.csv');
+  const previous = await mergeBars(csv, [bar(0), bar(2), bar(4)], options);
+  const summary = await mergeBars(csv, [bar(1), { ...bar(2), volume: -1 }, { ...bar(3), low: 8 }], {
+    ...options, summary: previous,
+  });
+  assert.equal(summary.rows, 4);
+  assert.deepEqual(await inspectCsv(csv), summary);
+  const text = await readFile(csv, 'utf8');
+  assert.match(text, /2020-01-01T02:00:00.000Z,2,4,1,2,5/);
+  assert.doesNotMatch(text, /03:00:00|\n\n/);
+});
+
+test('stored CSV validation still rejects invalid OHLCV instead of silently accepting corrupt checkpoints', async t => {
+  const directory = await temporary(t);
+  const csv = join(directory, 'eurusd-h1.csv');
+  await writeFile(csv, CSV_HEADER + '2020-01-01T00:00:00.000Z,5,4,1,2,5\n');
+  await assert.rejects(inspectCsv(csv), /Invalid OHLCV range/);
 });
 
 test('inspection rejects unsorted, duplicate and truncated CSV histories', async t => {
