@@ -263,9 +263,12 @@ export async function runSnapshot({
               try {
                 // Keep any existing history. For never-available instruments,
                 // write an honest header-only archive with explicit source status.
-                await ensureCsv(pair, group, directory, state.cutoff);
+                const csv = join(directory, `${pair.instrument}-${group.period}.csv`);
+                if (!pair.hasZip || await exists(csv)) {
+                  await ensureCsv(pair, group, directory, state.cutoff);
+                  await finishZip(pair, group, directory);
+                }
                 dirty = true;
-                await finishZip(pair, group, directory);
                 pair.unavailable = result.error.availability;
                 pair.cursor = state.cutoff;
                 log(`::warning::${task.instrument} ${task.period}: provider-unavailable; ` +
