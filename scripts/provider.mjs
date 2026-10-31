@@ -1,6 +1,7 @@
 import {
   normaliseDates, generateUrls, BufferFetcher, processData, formatOutput,
 } from 'dukascopy-node';
+import { confirmUnavailable } from './availability.mjs';
 
 const columnNames = ['times', 'opens', 'highs', 'lows', 'closes', 'volumes'];
 const periodMs = { h1: 3_600_000, d1: 86_400_000 };
@@ -36,9 +37,13 @@ function providerTimestamps(data, period) {
     // gap-filling loop against malformed, unbounded time deltas.
     if (delta > (period === 'h1' ? 31 * 24 : 366)) invalid('time delta exceeds one provider bucket');
     timestamp += delta * data.shift;
-    if (!Number.isFinite(timestamp) || !Number.isFinite(new Date(timestamp).getTime()) || actual.has(timestamp)) {
-      invalid('invalid or repeated candle timestamp');
+    if (!Number.isFinite(timestamp) || !Number.isFinite(new Date(timestamp).getTime())) {
+      invalid('invalid candle timestamp');
     }
+    // Zero time deltas are present in real historical data (USD/CNH D1 2012).
+    // Keep every encoded row through decoding: its price deltas also affect the
+    // following rows. Storage drops invalid bars and keeps the last valid row at
+    // each timestamp, so duplicates must not reject an otherwise usable bucket.
     actual.add(timestamp);
   }
   return actual;
@@ -53,7 +58,7 @@ function providerTimestamps(data, period) {
  * candles for missing intervals. Skip only validated empty buckets, then retain
  * only timestamps explicitly present in the provider's compressed response.
  */
-export async function getBars(task, fetcher) {
+export async function getBars(task, fetcher, { availabilityChecker = confirmUnavailable } = {}) {
   if (!Object.hasOwn(periodMs, task.period)) throw new Error('Only h1 and d1 provider tasks are supported');
   const from = new Date(task.from);
   const to = new Date(task.to);
@@ -75,7 +80,22 @@ export async function getBars(task, fetcher) {
     retryOnEmpty: false, failAfterRetryCount: true,
     rateLimitRetryCount: 3, wafMode: 'auto',
   });
-  const fetched = await (typeof transport === 'function' ? transport(urls) : transport.fetch(urls));
+  let fetched;
+  try {
+    fetched = await (typeof transport === 'function' ? transport(urls) : transport.fetch(urls));
+  } catch (error) {
+    // A 400 alone is not proof of missing history. Confirm withdrawal against
+    // the live catalog and the explicit "Unknown instrument" detail response.
+    if (/Request failed with status 400\b/.test(error.message)) {
+      const availability = await availabilityChecker(task.instrument);
+      if (availability) {
+        throw Object.assign(new Error(availability.reason), {
+          code: 'DUKASCOPY_INSTRUMENT_UNAVAILABLE', availability,
+        });
+      }
+    }
+    throw error;
+  }
   if (!Array.isArray(fetched) || fetched.length !== urls.length ||
       fetched.some((item, index) => item?.url !== urls[index] || !Buffer.isBuffer(item.buffer))) {
     invalid('fetcher did not return every requested bucket');

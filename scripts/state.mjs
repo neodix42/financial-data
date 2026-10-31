@@ -23,8 +23,11 @@ export function createState(catalog, cutoff, predecessor = null) {
       groups.get(id).pairs.push(previous ? {
         ...structuredClone(previous),
         retired: false,
+        unavailable: null,
         // Include the latest saved candle so updates replace it instead of duplicating it.
-        cursor: previous.summary?.last ?? predecessor.cutoff,
+        // If a withdrawn symbol returns, backfill from its original start when
+        // no history was obtainable, rather than silently skipping those years.
+        cursor: previous.summary?.last ?? (previous.unavailable ? previous.start : predecessor.cutoff),
       } : {
         instrument: item.instrument, start: item.starts[period], cursor: item.starts[period],
         summary: null, hasZip: false, zipSha256: null,
@@ -118,7 +121,7 @@ export function makeIndex(state) {
   ];
   for (const group of state.groups) for (const pair of group.pairs) {
     const complete = pair.retired || Date.parse(pair.cursor) >= Date.parse(state.cutoff);
-    const status = !complete ? 'pending' : pair.retired ? 'retired' : pair.summary?.rows ? 'ok' : 'no_data';
+    const status = !complete ? 'pending' : pair.unavailable ? 'unavailable' : pair.retired ? 'retired' : pair.summary?.rows ? 'ok' : 'no_data';
     lines.push([pair.instrument, group.period, group.category,
       pair.summary?.first ?? '-', pair.summary?.last ?? '-', pair.summary?.rows ?? 0,
       status, pair.bundle ?? '-', `${pair.instrument}-${group.period}.zip`].join('\t'));

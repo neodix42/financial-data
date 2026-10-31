@@ -15,7 +15,9 @@ export class DownloadPool {
       if (!pending) return;
       clearTimeout(pending.timer);
       this.pending.delete(result.id);
-      pending.resolve(result.error ? { error: new Error(result.error.message) } : { bars: result.bars });
+      pending.resolve(result.error ? { error: Object.assign(new Error(result.error.message), {
+        code: result.error.code, availability: result.error.availability,
+      }) } : { bars: result.bars });
     });
     this.worker.on('error', error => this.stop(error));
     this.worker.on('exit', code => {

@@ -128,7 +128,8 @@ async function snapshot(client, directory, options = {}) {
 
 async function readInstrument(client, releaseId, instrument, period, directory) {
   const manifest = client.manifest(releaseId);
-  const group = manifest.groups.find(item => item.period === period);
+  const group = manifest.groups.find(item => item.period === period &&
+    item.pairs.some(pair => pair.instrument === instrument));
   const pair = group.pairs.find(item => item.instrument === instrument);
   const archive = client.asset(releaseId, pair.bundle);
   const tar = join(directory, `${period}.tar`);
@@ -245,7 +246,7 @@ test('bad source OHLC candles are omitted from compact CSV files and incremental
 });
 
 test('instrument download or processing failures checkpoint other work and retry only the failed cursor next run', async t => {
-  for (const scenario of ['reported provider error', 'rejected download', 'invalid bar timestamp']) {
+  for (const scenario of ['reported provider error', 'rejected download', 'invalid bar timestamp', 'unconfirmed HTTP 400']) {
     await t.test(scenario, async () => {
       const directory = await mkdtemp(join(tmpdir(), 'financial-isolated-failure-'));
       try {
@@ -271,6 +272,7 @@ test('instrument download or processing failures checkpoint other work and retry
             if (task.instrument !== 'usatechidxusd' || task.period !== 'd1') return;
             if (scenario === 'reported provider error') return { error: new Error('Provider unavailable') };
             if (scenario === 'rejected download') throw new Error('Download promise rejected');
+            if (scenario === 'unconfirmed HTTP 400') return { error: new Error('Request failed with status 400') };
             return { bars: [{ ...bar('2026-01-03T00:00:00.000Z'), timestamp: 'invalid timestamp' }] };
           } }),
         });
@@ -349,6 +351,60 @@ test('an interrupted backfill checkpoints real partial files and resumes the nex
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
+test('a later retry downloads only pending histories at the saved cutoff before the next snapshot advances', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'financial-frozen-backfill-'));
+  try {
+    const client = new FakeGitHub();
+    const savedCutoff = '2026-01-03T00:00:00.000Z';
+    const laterCutoff = '2026-01-05T00:00:00.000Z';
+    const rows = [bar(start), bar('2026-01-02T00:00:00Z'),
+      bar('2026-01-03T00:00:00Z'), bar('2026-01-04T00:00:00Z')];
+    const interrupted = await snapshot(client, join(directory, 'initial'), {
+      cutoff: savedCutoff,
+      poolFactory: poolProvider({ rows, onTask(task) {
+        if (task.instrument === 'gbpusd' && task.period === 'd1') return { error: new Error('Temporary source failure') };
+      } }),
+    });
+    assert.equal(interrupted.status, 'checkpointed');
+    const checkpoint = client.checkpoint(interrupted.releaseId);
+    const hourly = checkpoint.groups.find(group => group.period === 'h1');
+    const hourlyArchiveIds = hourly.assets.map(asset => asset.id);
+    const pending = checkpoint.groups.flatMap(group => group.pairs
+      .filter(pair => !pair.hasZip || pair.cursor < savedCutoff)
+      .map(pair => ({ instrument: pair.instrument, period: group.period, cursor: pair.cursor })));
+    assert.deepEqual(pending, [{ instrument: 'gbpusd', period: 'd1', cursor: start }]);
+
+    const retryTasks = [];
+    const eventOffset = client.events.length;
+    const resumed = await snapshot(client, join(directory, 'later-retry'), {
+      cutoff: laterCutoff, poolFactory: poolProvider({ rows, tasks: retryTasks }),
+    });
+    assert.equal(resumed.status, 'published');
+    assert.equal(resumed.releaseId, interrupted.releaseId);
+    assert.deepEqual(retryTasks, [{ instrument: 'gbpusd', period: 'd1', from: start, to: savedCutoff }]);
+    const manifest = client.manifest(resumed.releaseId);
+    assert.equal(manifest.cutoff, savedCutoff, 'a retry must finish the checkpoint target instead of widening every completed history');
+    assert.deepEqual(manifest.groups.find(group => group.period === 'h1').assets.map(asset => asset.id), hourlyArchiveIds);
+    assert.ok(!client.events.slice(eventOffset).some(event => event.type === 'upload' && /-h1-.*\.tar$/.test(event.name)),
+      'a completed category archive must not be uploaded again during recovery');
+    const recovered = await readInstrument(client, resumed.releaseId, 'gbpusd', 'd1', join(directory, 'read'));
+    assert.equal(recovered.summary.rows, 2);
+    assert.equal(recovered.summary.last, '2026-01-02T00:00:00.000Z');
+
+    const updateTasks = [];
+    const next = await snapshot(client, join(directory, 'next-snapshot'), {
+      cutoff: laterCutoff, poolFactory: poolProvider({ rows, tasks: updateTasks }),
+    });
+    assert.equal(next.status, 'published');
+    assert.notEqual(next.releaseId, resumed.releaseId);
+    assert.equal(client.manifest(next.releaseId).cutoff, laterCutoff);
+    assert.equal(updateTasks.length, catalog.length * 2);
+    assert.ok(updateTasks.every(task => task.from === '2026-01-02T00:00:00.000Z' && task.to === laterCutoff));
+    assert.equal((await readInstrument(client, next.releaseId, 'gbpusd', 'd1', join(directory, 'updated-read'))).summary.rows, 4);
+    assert.equal(client.releases.length, 1);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 test('checkpoint upload failure retains predecessor and prior checkpoint; retry prunes orphans and publishes safely', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'financial-snapshot-'));
   try {
@@ -424,7 +480,7 @@ test('a zero-byte starter checkpoint is ignored during recovery and removed as a
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test('finalization interruption after metadata upload resumes with a later cutoff', async () => {
+test('a later attempt finishes interrupted finalization at the saved cutoff without redownloading', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'financial-snapshot-'));
   try {
     const client = new FakeGitHub();
@@ -437,20 +493,22 @@ test('finalization interruption after metadata upload resumes with a later cutof
     assert.ok(client.asset(draft.id, 'manifest.json'));
     assert.ok(client.asset(draft.id, 'index.txt'));
     assert.ok(!client.assets.get(draft.id).some(asset => asset.name.startsWith('checkpoint-')));
+    const archiveIds = client.assets.get(draft.id).filter(asset => asset.name.endsWith('.tar')).map(asset => asset.id);
     client.failPublish = false;
-    const updatedRows = [...rows, bar('2026-01-03T00:00:00Z')];
     const result = await snapshot(client, join(directory, 'resumed'), {
-      cutoff: '2026-01-04T00:00:00.000Z', poolFactory: poolProvider({ rows: updatedRows }),
+      cutoff: '2026-01-04T00:00:00.000Z',
+      poolFactory() { assert.fail('finalizing a saved snapshot must not start provider downloads'); },
     });
     assert.equal(result.status, 'published');
     assert.equal(result.releaseId, draft.id);
-    assert.equal(client.manifest(result.releaseId).cutoff, '2026-01-04T00:00:00.000Z');
+    assert.equal(client.manifest(result.releaseId).cutoff, '2026-01-03T00:00:00.000Z');
+    assert.deepEqual(client.assets.get(draft.id).filter(asset => asset.name.endsWith('.tar')).map(asset => asset.id), archiveIds);
     const stored = await readInstrument(client, result.releaseId, 'eurusd', 'h1', join(directory, 'read'));
-    assert.equal(stored.summary.rows, 3);
+    assert.equal(stored.summary.rows, 2);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test('recovery from a finalization interruption retains durable state if the following update also fails', async () => {
+test('recovery from a finalization interruption retains durable state if checkpointing fails again', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'financial-snapshot-'));
   try {
     const client = new FakeGitHub();
@@ -461,10 +519,10 @@ test('recovery from a finalization interruption retains durable state if the fol
     }), /interruption before publication/);
     const draft = client.releases[0];
     client.failPublish = false;
-    client.failUpload = ({ name }) => name.endsWith('.tar');
+    client.failUpload = ({ name }) => name.startsWith('checkpoint-');
     await assert.rejects(snapshot(client, join(directory, 'failed-again'), {
       cutoff: '2026-01-04T00:00:00.000Z',
-      poolFactory: poolProvider({ rows: [...rows, bar('2026-01-03T00:00:00Z')] }),
+      poolFactory() { assert.fail('finalization retries must not reopen completed histories'); },
     }), /Simulated upload failure/);
     assert.ok(client.assets.get(draft.id).some(asset => asset.state === 'uploaded' &&
       (asset.name === 'manifest.json' || /^checkpoint-\d{8}\.json$/.test(asset.name))),
@@ -472,9 +530,10 @@ test('recovery from a finalization interruption retains durable state if the fol
     client.failUpload = null;
     const resumed = await snapshot(client, join(directory, 'resumed'), {
       cutoff: '2026-01-04T00:00:00.000Z',
-      poolFactory: poolProvider({ rows: [...rows, bar('2026-01-03T00:00:00Z')] }),
+      poolFactory() { assert.fail('finalization retries must not reopen completed histories'); },
     });
     assert.equal(resumed.status, 'published');
+    assert.equal(client.manifest(resumed.releaseId).cutoff, '2026-01-03T00:00:00.000Z');
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -644,5 +703,139 @@ test('a handoff requested after all categories finish allows complete publicatio
     assert.equal(result.status, 'published');
     assert.equal(client.releases[0].draft, false);
     assert.equal(client.manifest(result.releaseId).complete, true);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+const unavailableCodes = { ahtgbgbx: 'AHT.GB-GBX', cclgbgbx: 'CCL.GB-GBX' };
+function unavailableResult(instrument) {
+  return { error: Object.assign(new Error('Unknown instrument; absent from current provider catalog'), {
+    code: 'DUKASCOPY_INSTRUMENT_UNAVAILABLE',
+    availability: {
+      code: unavailableCodes[instrument],
+      reason: 'Unknown instrument; absent from current provider catalog',
+      source: 'https://jetta.dukascopy.com/v1/instruments',
+      checkedAt: '2026-01-03T00:00:00.000Z',
+    },
+  }) };
+}
+
+const unavailableCatalog = ['ahtgbgbx', 'cclgbgbx'].map(instrument => ({
+  instrument, category: 'United Kingdom 🇬🇧', categorySlug: 'united-kingdom',
+  starts: { h1: start, d1: start },
+}));
+
+test('resume finishes only five pending pairs, records confirmed unavailable histories and preserves completed archives', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'financial-five-pending-'));
+  try {
+    const client = new FakeGitHub();
+    const recoveryCatalog = [catalog[0], {
+      instrument: 'usdcnh', category: 'Forex major currencies 💶', categorySlug: 'forex-major-currencies',
+      starts: { h1: start, d1: start },
+    }, ...unavailableCatalog];
+    const rows = [bar(start), bar('2026-01-02T00:00:00.000Z')];
+    const partial = await snapshot(client, join(directory, 'partial'), {
+      catalog: recoveryCatalog,
+      poolFactory: poolProvider({ rows, onTask(task) {
+        if (task.instrument in unavailableCodes || (task.instrument === 'usdcnh' && task.period === 'd1')) {
+          return { error: new Error('Original provider request failed') };
+        }
+      } }),
+    });
+    assert.equal(partial.status, 'checkpointed');
+    const checkpoint = client.checkpoint(partial.releaseId);
+    const pending = checkpoint.groups.flatMap(group => group.pairs.filter(pair => !pair.hasZip || pair.cursor < checkpoint.cutoff)
+      .map(pair => `${pair.instrument}-${group.period}`));
+    assert.equal(pending.length, 5);
+    const completedGroup = checkpoint.groups.find(group => group.id === 'forex-major-currencies-h1');
+    const completedArchiveIds = completedGroup.assets.map(asset => asset.id);
+    const savedZipHashes = new Map(checkpoint.groups.flatMap(group => group.pairs.filter(pair => pair.hasZip)
+      .map(pair => [`${pair.instrument}-${group.period}`, pair.zipSha256])));
+
+    const tasks = [];
+    const logs = [];
+    const resumed = await snapshot(client, join(directory, 'resumed'), {
+      catalog: recoveryCatalog, log: message => logs.push(message),
+      poolFactory: poolProvider({ rows, tasks, onTask(task) {
+        if (task.instrument in unavailableCodes) return unavailableResult(task.instrument);
+      } }),
+    });
+    assert.equal(resumed.status, 'published');
+    assert.equal(resumed.releaseId, partial.releaseId);
+    assert.deepEqual(tasks.map(task => `${task.instrument}-${task.period}`).sort(), pending.sort(),
+      'completed instruments are not downloaded again while resolving the five pending pairs');
+    const manifest = client.manifest(resumed.releaseId);
+    assert.equal(manifest.complete, true);
+    assert.deepEqual(manifest.groups.find(group => group.id === completedGroup.id).assets.map(asset => asset.id), completedArchiveIds,
+      'a completed category archive keeps its asset ID through publication');
+    for (const group of manifest.groups) for (const pair of group.pairs) {
+      const before = savedZipHashes.get(`${pair.instrument}-${group.period}`);
+      if (before) assert.equal(pair.zipSha256, before, 'completed instrument ZIP bytes remain unchanged');
+      if (!(pair.instrument in unavailableCodes)) continue;
+      assert.equal(pair.cursor, manifest.cutoff);
+      assert.equal(pair.summary.rows, 0);
+      assert.equal(pair.hasZip, true);
+      assert.deepEqual(pair.unavailable, unavailableResult(pair.instrument).error.availability);
+      const stored = await readInstrument(client, resumed.releaseId, pair.instrument, group.period,
+        join(directory, 'read-empty', `${pair.instrument}-${group.period}`));
+      assert.equal(stored.text, 'timestamp,open,high,low,close,volume\n');
+    }
+    const index = client.asset(resumed.releaseId, 'index.txt').bytes.toString();
+    const unavailableRows = index.trimEnd().split('\n').slice(2).filter(line => line.split('\t')[6] === 'unavailable');
+    assert.equal(unavailableRows.length, 4, 'both periods of both absent instruments are explicitly marked unavailable');
+    assert.ok(logs.some(message => message.includes('::warning::') && message.includes('ahtgbgbx')));
+
+    // An unavailable empty history must restart at its original beginning when
+    // the provider makes that instrument available again, rather than losing it.
+    const restoredTasks = [];
+    const restoredRows = [...rows, bar('2026-01-03T00:00:00.000Z'), bar('2026-01-04T00:00:00.000Z')];
+    const restored = await snapshot(client, join(directory, 'restored'), {
+      catalog: recoveryCatalog, cutoff: '2026-01-05T00:00:00.000Z',
+      poolFactory: poolProvider({ rows: restoredRows, tasks: restoredTasks }),
+    });
+    assert.equal(restored.status, 'published');
+    assert.equal(restoredTasks.filter(task => task.instrument in unavailableCodes).length, 4);
+    assert.ok(restoredTasks.filter(task => task.instrument in unavailableCodes).every(task => task.from === start),
+      'reinstated instruments backfill from their original starts');
+    const restoredManifest = client.manifest(restored.releaseId);
+    for (const group of restoredManifest.groups) for (const pair of group.pairs) {
+      if (!(pair.instrument in unavailableCodes)) continue;
+      assert.equal(pair.summary.rows, restoredRows.length);
+      assert.ok(!pair.unavailable, 'a successful provider retry clears the previous availability marker');
+    }
+    assert.ok(!client.asset(restored.releaseId, 'index.txt').bytes.toString().includes('\tunavailable\t'));
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('confirmed unavailable instruments preserve previously published history in both periods', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'financial-unavailable-retention-'));
+  try {
+    const client = new FakeGitHub();
+    const rows = [bar(start), bar('2026-01-02T00:00:00.000Z')];
+    const first = await snapshot(client, join(directory, 'initial'), {
+      catalog: unavailableCatalog, poolFactory: poolProvider({ rows }),
+    });
+    const original = client.manifest(first.releaseId);
+    const originalHashes = new Map(original.groups.flatMap(group => group.pairs.map(pair =>
+      [`${pair.instrument}-${group.period}`, pair.zipSha256])));
+    const update = await snapshot(client, join(directory, 'unavailable'), {
+      catalog: unavailableCatalog, cutoff: '2026-01-04T00:00:00.000Z',
+      poolFactory: poolProvider({ rows: [], onTask: task => unavailableResult(task.instrument) }),
+    });
+    assert.equal(update.status, 'published');
+    const manifest = client.manifest(update.releaseId);
+    for (const group of manifest.groups) for (const pair of group.pairs) {
+      assert.equal(pair.summary.rows, rows.length);
+      assert.equal(pair.summary.first, start);
+      assert.equal(pair.summary.last, '2026-01-02T00:00:00.000Z');
+      assert.equal(pair.zipSha256, originalHashes.get(`${pair.instrument}-${group.period}`));
+      assert.equal(pair.unavailable.code, unavailableCodes[pair.instrument]);
+      const stored = await readInstrument(client, update.releaseId, pair.instrument, group.period,
+        join(directory, 'read-history', `${pair.instrument}-${group.period}`));
+      assert.equal(stored.summary.rows, rows.length);
+    }
+    const lines = client.asset(update.releaseId, 'index.txt').bytes.toString().trimEnd().split('\n').slice(2);
+    assert.equal(lines.length, 4);
+    assert.ok(lines.every(line => line.split('\t')[6] === 'unavailable'));
+    assert.equal(client.releases.length, 1, 'the replacement retains existing history before pruning its predecessor');
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

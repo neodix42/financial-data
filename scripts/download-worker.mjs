@@ -6,6 +6,6 @@ parentPort.on('message', async ({ id, task }) => {
     const bars = await getBars(task);
     parentPort.postMessage({ id, bars });
   } catch (error) {
-    parentPort.postMessage({ id, error: { message: error.message, code: error.code } });
+    parentPort.postMessage({ id, error: { message: error.message, code: error.code, availability: error.availability } });
   }
 });

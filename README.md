@@ -122,6 +122,16 @@ successfully as `checkpointed`; it does not publish an incomplete replacement.
 Errors writing or validating a durable checkpoint still stop the run so unsafe
 state cannot replace the last recoverable checkpoint.
 
+An instrument withdrawn from the current provider API is recorded separately as
+`unavailable`, not `no_data`. This classification requires both a successful,
+validated live-catalog response omitting its code and the detail endpoint's
+explicit `Unknown instrument` response; an arbitrary HTTP 400 or a network error
+never qualifies. Any previously downloaded history is retained, and an instrument
+with no obtainable history gets a header-only CSV. The manifest records the
+provider code, reason, source and verification time. These confirmed unavailable
+entries do not block publication of the available histories. A later snapshot
+checks the symbol again and backfills from its original start if it returns.
+
 `manifest.json` records the full category and instrument mapping, progress,
 cutoff, configuration, archive sizes and SHA-256 checksums. Data files are stored
 only in releases; the workflow makes no dataset commits. Local working files
@@ -149,8 +159,10 @@ checkpoint uploads. GitHub transfers and retries have a separate deadline at
 5 hours 55 minutes to avoid running into the hard timeout.
 
 The next attempt restores the draft, validates checksums, and resumes from each
-saved cursor. Its cutoff advances to the new attempt time; previously completed
-instruments fetch their recent overlap too. A runner crash or forced cancellation
+saved cursor using the draft's original cutoff. Completed instruments and category
+archives stay complete; only unfinished histories are downloaded before publishing
+that snapshot. After publication, the next update creates a new snapshot with a
+fresh cutoff and fetches the latest-bar overlap. A runner crash or forced cancellation
 can lose work since the last durable checkpoint, but never invalidates the last
 committed checkpoint or the preceding published snapshot. No software can
 finish a new checkpoint after a runner is forcibly killed.

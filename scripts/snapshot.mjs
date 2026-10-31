@@ -191,7 +191,10 @@ export async function runSnapshot({
   let release = drafts[0];
   let state = release ? await readManifest(client, release, workDirectory) : null;
   if (state) {
-    resumeState(state, cutoff, catalog);
+    // Finish the saved snapshot before widening its target. Moving the cutoff on
+    // every retry reopens completed histories and can prevent a backfill from
+    // ever reaching publication; a new snapshot advances it after this publishes.
+    resumeState(state, state.cutoff, catalog);
     log(`Resuming ${release.tag_name} from checkpoint ${state.sequence}; cutoff ${state.cutoff}`);
     // Keep the last committed checkpoint until the new one is durable.
     await pruneDraft(client, release, state, log);
@@ -255,7 +258,22 @@ export async function runSnapshot({
         for (const [index, result] of results.entries()) {
           const pair = jobs[index];
           const task = tasks[index];
-          if (result.error) { recordFailure(group, task, result.error); continue; }
+          if (result.error) {
+            if (result.error.code === 'DUKASCOPY_INSTRUMENT_UNAVAILABLE' && result.error.availability) {
+              try {
+                // Keep any existing history. For never-available instruments,
+                // write an honest header-only archive with explicit source status.
+                await ensureCsv(pair, group, directory, state.cutoff);
+                dirty = true;
+                await finishZip(pair, group, directory);
+                pair.unavailable = result.error.availability;
+                pair.cursor = state.cutoff;
+                log(`::warning::${task.instrument} ${task.period}: provider-unavailable; ` +
+                  `${result.error.message}. Existing history retained and status recorded in index.txt.`);
+              } catch (error) { recordFailure(group, task, error); }
+            } else recordFailure(group, task, result.error);
+            continue;
+          }
           if (result.cancelled) {
             if (!stop.requested && Date.now() < deadline) recordFailure(group, task, new Error('Download cancelled before completion'));
             continue;
